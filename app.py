@@ -57,7 +57,7 @@ def _get(path: str):
     return r.json()
 
 # ── Live data fetchers ────────────────────────────────────────────────────────
-@st.cache_data(ttl=180)   # refresh every 3 minutes
+@st.cache_data(ttl=180, scope="session")   # refresh every 3 minutes
 def fetch_nifty_ltp() -> float:
     """Fetch live NIFTY spot price."""
     resp = _post("/marketfeed/ltp", {"IDX_I": [NIFTY_SCRIP]})
