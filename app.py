@@ -1,6 +1,7 @@
 import os
 import datetime
 import requests
+import pytz
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -56,13 +57,13 @@ def _get(path: str):
     return r.json()
 
 # ── Live data fetchers ────────────────────────────────────────────────────────
-@st.cache_data(ttl=60)   # refresh every 60 seconds
+@st.cache_data(ttl=180)   # refresh every 3 minutes
 def fetch_nifty_ltp() -> float:
     """Fetch live NIFTY spot price."""
     resp = _post("/marketfeed/ltp", {"IDX_I": [NIFTY_SCRIP]})
     return float(resp["data"]["IDX_I"][str(NIFTY_SCRIP)]["last_price"])
 
-@st.cache_data(ttl=180)  # refresh every 3 minutes (Dhan rate limit)
+@st.cache_data(ttl=180, scope="session")  # refresh every 3 minutes (Dhan rate limit)
 def fetch_expiry_list() -> list:
     """Fetch available expiry dates for NIFTY options."""
     resp = _post("/optionchain/expirylist", {
@@ -120,7 +121,9 @@ def fetch_intraday_history() -> pd.DataFrame:
     Fetches NIFTY candles for calculations. 
     Falls back to daily historical data if intraday data is empty (market closed).
     """
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    IST = pytz.timezone("Asia/Kolkata")
+    today_ist = datetime.datetime.now(IST).date()
+    today_str = today_ist.strftime("%Y-%m-%d")
     
     # Step 1: Try fetching today's live intraday 5-min candles
     try:
@@ -140,8 +143,7 @@ def fetch_intraday_history() -> pd.DataFrame:
             return pd.DataFrame({"close": closes})
     except Exception:
         pass 
-    past_date_str = (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-    
+    past_date_str = (today_ist - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     try:
         # Dhan's Historical Daily Data API Endpoint
         resp = _post("/charts/historical", {
