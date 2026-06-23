@@ -171,10 +171,68 @@ def fetch_option_chain(expiry: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=60, scope="session")
 def fetch_intraday_history() -> pd.DataFrame:
-    """Fetches historical daily chart data utilizing timezone-safe constraints."""
+    """
+    ✅ FIXED: Fetches 5-minute intraday data.
+    Dhan API returns separate O/H/L/C/V/T arrays at ROOT level (not under "data" key).
+    """
     now_in_india = datetime.datetime.now(IST)
     today_str = now_in_india.strftime("%Y-%m-%d")
     past_str = (now_in_india - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    try:
+        resp = _post("/charts/intraday", {
+            "securityId": NIFTY_SEC_ID,
+            "exchangeSegment": "IDX_I",
+            "instrument": "INDEX",
+            "expiryCode": 0,
+            "oi": False,
+            "fromDate": past_str,
+            "toDate": today_str,
+        })
+        
+        # ✅ CORRECT: Arrays are at ROOT level, NOT under "data" key
+        opens = resp.get("open", [])
+        highs = resp.get("high", [])
+        lows = resp.get("low", [])
+        closes = resp.get("close", [])
+        volumes = resp.get("volume", [])
+        timestamps = resp.get("timestamp", [])
+        
+        if not closes or len(closes) == 0:
+            st.warning("⚠️ No close data returned from API")
+            return pd.DataFrame()
+        
+        # ✅ BUILD DataFrame from separate arrays
+        df = pd.DataFrame({
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "timestamp": timestamps
+        })
+        
+        # ✅ Convert timestamp from Unix epoch seconds to IST datetime
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(IST)
+        df["date"] = df["datetime"].dt.date
+        
+        # ✅ Ensure close is numeric
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["close"]).reset_index(drop=True)
+        
+        return df
+    except Exception as e:
+        st.warning(f"⚠️ Intraday fetch failed: {e}")
+        import traceback
+        st.write(f"**Error details:** {traceback.format_exc()}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=180, scope="session")
+def fetch_daily_close_history() -> pd.DataFrame:
+    """Fetches daily historical data as backup."""
+    now_in_india = datetime.datetime.now(IST)
+    today_str = now_in_india.strftime("%Y-%m-%d")
+    past_str = (now_in_india - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
     
     try:
         resp = _post("/charts/historical", {
@@ -219,16 +277,38 @@ def calc_roc(series: pd.Series, period: int = 10) -> float:
 def find_atm(spot: float, strikes: pd.Series) -> float:
     return float(strikes.iloc[(strikes - spot).abs().argsort().iloc[0]])
 
-def day_change_pct(hist_df: pd.DataFrame, current_spot: float) -> str:
-    """Calculates day change percentage against the previous session's confirmed close."""
-    if hist_df.empty or len(hist_df) < 1:
+def day_change_pct(intraday_df: pd.DataFrame, current_spot: float) -> str:
+    """
+    ✅ FIXED: Calculates day change % by finding yesterday's last candle.
+    Works with Dhan's actual data structure.
+    """
+    if intraday_df.empty or "date" not in intraday_df.columns:
         return "N/A"
-    previous_close = float(hist_df["close"].iloc[-2]) if len(hist_df) >= 2 else float(hist_df["close"].iloc[-1])
-    if previous_close == 0:
-        return "N/A"
-    pct = ((current_spot - previous_close) / previous_close) * 100
-    sign = "+" if pct >= 0 else ""
-    return f"{sign}{pct:.2f}%"
+    
+    now_in_india = datetime.datetime.now(IST)
+    today = now_in_india.date()
+    
+    # ✅ Try to find yesterday's last candle (handle weekends/holidays)
+    for days_back in range(1, 6):
+        target_date = today - datetime.timedelta(days=days_back)
+        matching = intraday_df[intraday_df["date"] == target_date]
+        
+        if not matching.empty:
+            yesterday_close = float(matching["close"].iloc[-1])
+            if yesterday_close > 0:
+                pct = ((current_spot - yesterday_close) / yesterday_close) * 100
+                sign = "+" if pct >= 0 else ""
+                return f"{sign}{pct:.2f}%"
+    
+    # Fallback: use second-to-last close if no prior trading day found
+    if len(intraday_df) >= 2:
+        yesterday_close = float(intraday_df["close"].iloc[-2])
+        if yesterday_close > 0:
+            pct = ((current_spot - yesterday_close) / yesterday_close) * 100
+            sign = "+" if pct >= 0 else ""
+            return f"{sign}{pct:.2f}%"
+    
+    return "N/A"
 
 def auto_regime(spot: float, ema20: float, ema50: float, rsi: float, agg_vega: float, call_oi: float, put_oi: float) -> tuple[str, str]:
     bullish = spot > ema20 > ema50
@@ -290,16 +370,25 @@ except Exception as e:
     st.error(f"Failed to fetch market data streams: {e}")
     st.stop()
 
-hist_df = fetch_intraday_history()
+# ✅ FIXED: Fetch intraday data (for Section 2 and day change)
+intraday_df = fetch_intraday_history()
+daily_df = fetch_daily_close_history()
 
 # ── Compute Metric Values ─────────────────────────────────────────────────────
 atm_strike  = find_atm(nifty_spot, chain_df["strike"])
-day_chg     = day_change_pct(hist_df, nifty_spot)
-closes      = hist_df["close"] if not hist_df.empty else pd.Series([nifty_spot])
-rsi_val     = calc_rsi(closes)
-ema20       = calc_ema(closes, 20)
-ema50       = calc_ema(closes, 50)
-roc_val     = calc_roc(closes)
+day_chg     = day_change_pct(intraday_df, nifty_spot)
+
+# ✅ FIXED: Section 2 uses 5-minute intraday data
+if not intraday_df.empty:
+    closes_5min = intraday_df["close"].astype(float)
+    rsi_val     = calc_rsi(closes_5min)
+    ema20       = calc_ema(closes_5min, 20)
+    ema50       = calc_ema(closes_5min, 50)
+    roc_val     = calc_roc(closes_5min)
+else:
+    st.warning("⚠️ No intraday data available. Using fallback values.")
+    rsi_val, ema20, ema50, roc_val = 50.0, nifty_spot, nifty_spot, 0.0
+
 now_str     = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
 all_strikes  = sorted(chain_df["strike"].unique())
@@ -324,8 +413,8 @@ col3.metric("Time",        now_str)
 col4.metric("Day Change",  day_chg)
 st.divider()
 
-# ── Section 2: Underlying NIFTY State ────────────────────────────────────────
-st.header("2. Underlying (NIFTY State)")
+# ── Section 2: Underlying NIFTY State (5-minute data) ────────────────────────
+st.header("2. Underlying (NIFTY State) — 5-Minute Frame")
 rsi_interp, rsi_bias = interpret_rsi(rsi_val)
 
 vs_ema20 = "Above" if nifty_spot > ema20 else "Below"
@@ -342,7 +431,7 @@ nifty_state_data = {
     "Interpretation": [rsi_interp, f"Price {'above' if nifty_spot > ema20 else 'below'} 20 EMA ({ema20:.2f})", f"Price {'above' if nifty_spot > ema50 else 'below'} 50 EMA ({ema50:.2f})", "Accelerating" if roc_val > 0 else "Decelerating"],
     "Action Bias":   [rsi_bias, ema20_bias, ema50_bias, roc_bias],
 }
-st.dataframe(pd.DataFrame(nifty_state_data), width="stretch", hide_index=True)
+st.dataframe(pd.DataFrame(nifty_state_data), use_container_width=True, hide_index=True)
 st.divider()
 
 # ── Section 3: ATM Analysis ───────────────────────────────────────────────────
@@ -359,7 +448,7 @@ with col1:
         "Interpretation": ["Market price of call",  call_delta_interp, "Time decay per day", "Implied volatility"],
         "Action Bias":   [call_delta_bias, call_delta_bias, "Neutral", "Monitor"],
     }
-    st.dataframe(pd.DataFrame(call_table), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(call_table), use_container_width=True, hide_index=True)
 
 with col2:
     st.subheader(f"ATM Put  ({atm_strike:.0f} PE)")
@@ -371,7 +460,7 @@ with col2:
         "Interpretation": ["Market price of put",  put_delta_interp, "Time decay per day", "Implied volatility"],
         "Action Bias":   [put_delta_bias, put_delta_bias, "Neutral", "Monitor"],
     }
-    st.dataframe(pd.DataFrame(put_table), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(put_table), use_container_width=True, hide_index=True)
 st.divider()
 
 # ── Section 4: Cumulative Greeks ──────────────────────────────────────────────
@@ -388,7 +477,7 @@ greeks_table = {
     "Interpretation":   ["Net Long build" if agg_delta > 0 else "Net Short build", "High pinning risk" if agg_gamma > 0.05 else "Low pinning risk", vega_interp, "Chain decaying fast" if agg_theta < -50 else "Moderate decay"],
     "Bias":             ["Bullish" if agg_delta > 0 else "Bearish", "Caution" if agg_gamma > 0.05 else "Neutral", vega_bias, "Neutral"],
 }
-st.dataframe(pd.DataFrame(greeks_table), width="stretch", hide_index=True)
+st.dataframe(pd.DataFrame(greeks_table), use_container_width=True, hide_index=True)
 
 total_call_oi = filtered_df["call_oi"].sum()
 total_put_oi  = filtered_df["put_oi"].sum()
@@ -406,5 +495,5 @@ display_chain = filtered_df[[
 ]].copy()
 display_chain.columns = ["Strike", "Call LTP", "Call OI", "Call IV%", "Delta", "Gamma", "Vega", "Theta", "Put LTP", "Put OI", "Put IV%"]
 
-st.dataframe(display_chain.style.format(precision=2), width="stretch", hide_index=True)
+st.dataframe(display_chain.style.format(precision=2), use_container_width=True, hide_index=True)
 st.divider()
